@@ -1,141 +1,119 @@
-# STEP 1: Install dependencies
-!pip install openpyxl
+!pip install openpyxl xgboost
 
-# STEP 2: Import libraries
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split, GridSearchCV
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_validate
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
-
-# Upload file
+from sklearn.impute import SimpleImputer
+from sklearn.feature_selection import VarianceThreshold
+from xgboost import XGBClassifier
 from google.colab import files
+
 uploaded = files.upload()
 
-# Load the data
-df = pd.read_excel('Churn_Modelling.csv.xlsx')
+for file_name in uploaded.keys():
+    if file_name.endswith('.csv'):
+        df = pd.read_csv(file_name)
+    elif file_name.endswith(('.xls', '.xlsx')):
+        df = pd.read_excel(file_name)
+    else:
+        raise ValueError("Unsupported file type")
 
-# Drop unnecessary columns
-df = df.drop(['RowNumber', 'CustomerId', 'Surname'], axis=1)
+target_column = 'Exited'
+columns_to_drop = ['RowNumber', 'CustomerId', 'Surname']
+df = df.drop(columns=[col for col in columns_to_drop if col in df.columns])
 
-# Check for missing values
-print("Missing values:\n", df.isnull().sum())
+X = df.drop(target_column, axis=1)
+y = df[target_column]
 
-# Explore the target variable
-print("\nTarget Distribution:\n", df['Exited'].value_counts(normalize=True))
+numeric_features = X.select_dtypes(include=['int64', 'float64']).columns.tolist()
+categorical_features = X.select_dtypes(include=['object', 'category', 'bool']).columns.tolist()
 
-# Separate features and target
-X = df.drop('Exited', axis=1)
-y = df['Exited']
-
-# Split data into train and test
 X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=0.2, random_state=42, stratify=y)
 
-# Define Preprocessing
-numeric_features = ['CreditScore', 'Age', 'Tenure', 'Balance', 'NumOfProducts', 'EstimatedSalary']
-categorical_features = ['Geography', 'Gender', 'HasCrCard', 'IsActiveMember']
-
 numeric_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='median')),
+    ('variance_filter', VarianceThreshold(threshold=0.0)),
     ('scaler', StandardScaler())
 ])
 
 categorical_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='most_frequent')),
     ('onehot', OneHotEncoder(handle_unknown='ignore'))
 ])
 
-preprocessor = ColumnTransformer(
-    transformers=[
-        ('num', numeric_transformer, numeric_features),
-        ('cat', categorical_transformer, categorical_features)
+preprocessor = ColumnTransformer(transformers=[
+    ('num', numeric_transformer, numeric_features),
+    ('cat', categorical_transformer, categorical_features)
+])
+
+models = {
+    'Random Forest': RandomForestClassifier(random_state=42, class_weight='balanced'),
+    'XGBoost': XGBClassifier(random_state=42, use_label_encoder=False, eval_metric='logloss'),
+    'AdaBoost': AdaBoostClassifier(random_state=42)
+}
+
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+scoring = ['accuracy', 'precision', 'recall', 'f1', 'roc_auc']
+best_model = None
+best_score = 0
+best_name = ""
+results_dict = {}
+
+for name, clf in models.items():
+    print(f"\n=== {name} ===")
+    pipeline = Pipeline(steps=[
+        ('preprocessor', preprocessor),
+        ('classifier', clf)
     ])
+    
+    pipeline.fit(X_train, y_train)
+    y_pred = pipeline.predict(X_test)
+    y_proba = pipeline.predict_proba(X_test)[:, 1]
 
-# Logistic Regression Model
+    print(classification_report(y_test, y_pred))
+    print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred))
+    print("ROC AUC Score (Test Set):", roc_auc_score(y_test, y_proba))
 
-lr_pipeline = Pipeline(steps=[
-    ('preprocessor', preprocessor),
-    ('classifier', LogisticRegression(random_state=42, class_weight='balanced'))
-])
+    cv_results = cross_validate(pipeline, X, y, cv=cv, scoring=scoring, return_train_score=False)
+    mean_roc_auc = np.mean(cv_results['test_roc_auc'])
+    results_dict[name] = mean_roc_auc
 
-lr_pipeline.fit(X_train, y_train)
-y_pred_lr = lr_pipeline.predict(X_test)
-y_proba_lr = lr_pipeline.predict_proba(X_test)[:, 1]
+    for metric in scoring:
+        mean_score = np.mean(cv_results[f'test_{metric}'])
+        print(f"{metric.capitalize()} (mean CV): {mean_score:.4f}")
+    
+    if mean_roc_auc > best_score:
+        best_score = mean_roc_auc
+        best_model = pipeline
+        best_name = name
+    
+    if hasattr(pipeline.named_steps['classifier'], 'feature_importances_'):
+        fitted_preprocessor = pipeline.named_steps['preprocessor']
+        ohe = fitted_preprocessor.named_transformers_['cat'].named_steps['onehot']
+        cat_feature_names = ohe.get_feature_names_out(categorical_features)
+        feature_names = numeric_features + list(cat_feature_names)
+        importances = pipeline.named_steps['classifier'].feature_importances_
 
-print("\n=== Logistic Regression Results ===")
-print(classification_report(y_test, y_pred_lr))
-print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred_lr))
-print("ROC AUC Score:", roc_auc_score(y_test, y_proba_lr))
+        importance_df = pd.DataFrame({
+            'Feature': feature_names,
+            'Importance': importances
+        }).sort_values(by='Importance', ascending=False)
 
+        plt.figure(figsize=(10, 6))
+        plt.barh(importance_df['Feature'][:15][::-1], importance_df['Importance'][:15][::-1], color='skyblue')
+        plt.xlabel('Feature Importance')
+        plt.title(f'Top 15 Important Features - {name}')
+        plt.tight_layout()
+        plt.show()
 
-# Random Forest Model with GridSearch
+print("\n")
+print(f" Best Model: {best_name} (CV ROC AUC: {best_score:.4f})")
 
-rf_pipeline = Pipeline(steps=[
-    ('preprocessor', preprocessor),
-    ('classifier', RandomForestClassifier(random_state=42, class_weight='balanced'))
-])
-
-param_grid_rf = {
-    'classifier__n_estimators': [100, 200],
-    'classifier__max_depth': [None, 10, 20],
-    'classifier__min_samples_split': [2, 5]
-}
-
-grid_search_rf = GridSearchCV(rf_pipeline, param_grid_rf, cv=5, scoring='roc_auc', n_jobs=-1)
-grid_search_rf.fit(X_train, y_train)
-
-best_rf = grid_search_rf.best_estimator_
-y_pred_rf = best_rf.predict(X_test)
-y_proba_rf = best_rf.predict_proba(X_test)[:, 1]
-
-print("\n=== Random Forest Results ===")
-print("Best Parameters:", grid_search_rf.best_params_)
-print(classification_report(y_test, y_pred_rf))
-print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred_rf))
-print("ROC AUC Score:", roc_auc_score(y_test, y_proba_rf))
-
-# Gradient Boosting Model with GridSearch
-
-gb_pipeline = Pipeline(steps=[
-    ('preprocessor', preprocessor),
-    ('classifier', GradientBoostingClassifier(random_state=42))
-])
-
-param_grid_gb = {
-    'classifier__n_estimators': [100, 200],
-    'classifier__learning_rate': [0.1, 0.05],
-    'classifier__max_depth': [3, 5]
-}
-
-grid_search_gb = GridSearchCV(gb_pipeline, param_grid_gb, cv=5, scoring='roc_auc', n_jobs=-1)
-grid_search_gb.fit(X_train, y_train)
-
-best_gb = grid_search_gb.best_estimator_
-y_pred_gb = best_gb.predict(X_test)
-y_proba_gb = best_gb.predict_proba(X_test)[:, 1]
-
-print("\n=== Gradient Boosting Results ===")
-print("Best Parameters:", grid_search_gb.best_params_)
-print(classification_report(y_test, y_pred_gb))
-print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred_gb))
-print("ROC AUC Score:", roc_auc_score(y_test, y_proba_gb))
-
-# Feature Importance for Random Forest
-
-preprocessor.fit(X_train)
-feature_names = numeric_features + list(
-    preprocessor.named_transformers_['cat'].named_steps['onehot']
-    .get_feature_names_out(categorical_features))
-
-if hasattr(best_rf.named_steps['classifier'], 'feature_importances_'):
-    importances = best_rf.named_steps['classifier'].feature_importances_
-    feature_importance = pd.DataFrame({
-        'Feature': feature_names,
-        'Importance': importances
-    }).sort_values(by='Importance', ascending=False)
-
-    print("\n=== Random Forest Feature Importances ===")
-    print(feature_importance.head(10))
